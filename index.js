@@ -350,16 +350,20 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
   return res.status(403).json({ error: "Forbidden" });
 };
 
-async function run() {
-  try {
-    await client.connect();
+// async function run() {
+//   try {
+    // await client.connect();
 
     const db = client.db("dolna_db");
     const productsCollection = db.collection("products");
     const ordersCollection = db.collection("orders");
     const wishlistsCollection = db.collection("wishlists");
-    await wishlistsCollection.createIndex({ userId: 1 }, { unique: true });
-    await ordersCollection.createIndex({ userId: 1 });
+    client.connect()
+      .then(() => Promise.all([
+        wishlistsCollection.createIndex({ userId: 1 }, { unique: true }),
+        ordersCollection.createIndex({ userId: 1 })
+      ]))
+      .catch(console.dir);
 
     //Add Products API
     app.post('/add-products', verifyToken, async (req, res) => {
@@ -1192,13 +1196,13 @@ async function run() {
       }
     })
 
-    await client.db("admin").command({ ping: 1 });
-    console.log("Pinged your deployment. You successfully connected to MongoDB!");
-  } finally {
+    // await client.db("admin").command({ ping: 1 });
+    // console.log("Pinged your deployment. You successfully connected to MongoDB!");
+  // } finally {
     // await client.close();
-  }
-}
-run().catch(console.dir);
+//   }
+// }
+// run().catch(console.dir);
 
 app.get('/', (req, res) => {
   res.send('Hello World!');
@@ -1207,3 +1211,5 @@ app.get('/', (req, res) => {
 app.listen(port, () => {
   console.log(`Example app listening on port ${port}`);
 });
+
+module.exports = app;
