@@ -39,6 +39,107 @@ const validateImages = (images) => {
   return null;
 };
 
+//Category Handler
+const MAX_CATEGORY_NAME = 80;
+
+// Mirrors the client slugifyCategory so names stay consistent across apps.
+const slugifyCategory = (value) => {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (!raw) return "";
+  return raw
+    .replace(/[\s_]+/g, "-")
+    .replace(/[^a-z0-9\u0980-\u09FF-]+/g, "")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+};
+
+const validateCategoryName = (raw) => {
+  const name = typeof raw === "string" ? raw.trim() : "";
+  if (!name) return { error: "name is required" };
+  if (name.length > MAX_CATEGORY_NAME) {
+    return { error: `name must be at most ${MAX_CATEGORY_NAME} characters` };
+  }
+  const slug = slugifyCategory(name);
+  if (!slug) return { error: "name must contain letters or numbers" };
+  return { value: { name, slug } };
+};
+
+const validateCategoryImage = (raw) => {
+  if (raw === undefined) return { value: undefined };
+  if (raw === null || raw === "") return { value: null };
+  if (!isValidUrl(raw)) return { error: "image must be a valid http(s) URL" };
+  return { value: String(raw).trim() };
+};
+
+// Optional product policy fields shown on the product details page.
+// Empty / whitespace-only means absent and is hidden on the storefront.
+const POLICY_FIELDS = ["disclaimer", "note", "deliveryPayment", "returnPolicy"];
+const MAX_POLICY_LEN = 5000;
+
+const normalizePolicyField = (raw) => {
+  if (raw === undefined) return { value: undefined };
+  if (raw === null) return { value: "" };
+  if (typeof raw !== "string") return { error: "must be a string" };
+  const value = raw.trim();
+  if (value.length > MAX_POLICY_LEN) {
+    return { error: `must be at most ${MAX_POLICY_LEN} characters` };
+  }
+  return { value };
+};
+
+// Sub-categories 
+const normalizeSubcategory = (sub) => {
+  const name = typeof sub?.name === "string" ? sub.name.trim() : "";
+  return {
+    _id: sub?._id ?? new ObjectId(),
+    name,
+    slug: slugifyCategory(sub?.slug ?? name),
+    image: isValidUrl(sub?.image) ? sub.image : null,
+    createdAt: sub?.createdAt ?? new Date(),
+  };
+};
+
+const findSubcategory = (doc, slug) => {
+  const target = String(slug ?? "").trim().toLowerCase();
+  if (!target) return null;
+  const subs = Array.isArray(doc?.subcategories) ? doc.subcategories : [];
+  return (
+    subs.find((s) => String(s?._id?.toString?.() ?? "") === target) ??
+    subs.find((s) => String(s?.slug ?? "").toLowerCase() === target || String(s?.name ?? "").toLowerCase() === target) ??
+    null
+  );
+};
+
+const isDuplicateKeyError = (error) => error?.code === 11000;
+
+
+const resolveCategoryAssignment = async (raw) => {
+  const parentInput = typeof raw?.category === "string" ? raw.category.trim() : "";
+  const subInput = typeof raw?.subcategory === "string" ? raw.subcategory.trim() : "";
+  if (!parentInput) return { error: "category is required" };
+
+  const parentSlug = slugifyCategory(parentInput);
+  const subSlug = slugifyCategory(subInput);
+  if (!parentSlug) return { error: "category must contain letters or numbers" };
+
+  const categories = await categoriesCollection.find({}).toArray();
+  if (categories.length === 0) {
+    return { value: { category: parentSlug, subcategory: subSlug } };
+  }
+
+  const parent =
+    categories.find((c) => c.slug === parentSlug) ??
+    categories.find((c) => String(c.name).toLowerCase() === parentInput.toLowerCase());
+  if (!parent) return { error: `unknown category: ${parentInput}` };
+
+  if (!subSlug) return { value: { category: parent.slug, subcategory: "" } };
+
+  const sub = findSubcategory(parent, subSlug);
+  if (!sub) return { error: `unknown sub-category "${subInput}" in ${parent.name}` };
+
+  return { value: { category: parent.slug, subcategory: sub.slug } };
+};
+
 //Order Handler (COD only)
 const validateOrder = (body) => {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
@@ -358,10 +459,13 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
     const productsCollection = db.collection("products");
     const ordersCollection = db.collection("orders");
     const wishlistsCollection = db.collection("wishlists");
+    const categoriesCollection = db.collection("categories");
     client.connect()
       .then(() => Promise.all([
         wishlistsCollection.createIndex({ userId: 1 }, { unique: true }),
-        ordersCollection.createIndex({ userId: 1 })
+        ordersCollection.createIndex({ userId: 1 }),
+        categoriesCollection.createIndex({ slug: 1 }, { unique: true }),
+        productsCollection.createIndex({ category: 1, subcategory: 1 }),
       ]))
       .catch(console.dir);
 
@@ -378,8 +482,27 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
         // Cover image
         const image = isValidUrl(product.image) ? product.image.trim() : images[0];
 
+        const assignment = await resolveCategoryAssignment(product);
+        if (assignment.error) {
+          return res.status(400).json({ error: assignment.error });
+        }
+
+        const { category, subcategory } = assignment.value;
+
+        const policies = {};
+        for (const field of POLICY_FIELDS) {
+          const check = normalizePolicyField(product[field]);
+          if (check.error) {
+            return res.status(400).json({ error: `${field} ${check.error}` });
+          }
+          if (check.value !== undefined) policies[field] = check.value;
+        }
+
         const result = await productsCollection.insertOne({
           ...product,
+          ...policies,
+          category,
+          subcategory,
           image,
           images,
           price: Number(product.price),
@@ -397,13 +520,46 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
     // Supports server-side pagination: pass ?page=&limit= to receive
     // { products, total, page, limit, totalPages, sort, facets }. Without pagination params
     // the legacy bare array is returned. Optional filters (combinable):
-    // ?search= (name, category, price), ?category= (repeatable), ?minPrice=&maxPrice=,
+    // ?search= (name, category, subcategory, price), ?category= and ?subcategory=
+    // (repeatable, comma-separated), ?minPrice=&maxPrice=,
     // ?inStock=true, ?sort=newest|price-asc|price-desc|name
     const PRODUCT_SORTS = {
       "newest": { _id: -1 },
       "price-asc": { price: 1, _id: -1 },
       "price-desc": { price: -1, _id: -1 },
       "name": { name: 1, _id: -1 },
+    };
+    // Values are stored as slugs, but products created before categories existed
+    // hold display names. Match the exact value plus a separator-insensitive
+    // pattern so those legacy rows stay reachable without a migration.
+    const looseValuePattern = (value) => {
+      const raw = String(value ?? "").trim();
+      if (!raw) return null;
+      const escaped = raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`^${escaped.replace(/[-\s_]+/g, "[-\\s_]*")}$`, "i");
+    };
+    const parseListFilter = (raw) => {
+      const inputs = Array.isArray(raw) ? raw : (raw !== undefined ? [raw] : []);
+      const rawValues = [];
+      const slugs = [];
+      for (const entry of inputs) {
+        for (const part of String(entry).split(",")) {
+          const value = part.trim();
+          if (!value) continue;
+          rawValues.push(value);
+          const slug = slugifyCategory(value);
+          if (slug && !slugs.includes(slug)) slugs.push(slug);
+        }
+      }
+      return [...new Set([...slugs, ...rawValues])];
+    };
+    const matchList = (field, values) => {
+      const clauses = values.map((value) => ({ [field]: value }));
+      for (const value of values) {
+        const pattern = looseValuePattern(value);
+        if (pattern) clauses.push({ [field]: pattern });
+      }
+      return clauses.length === 1 ? clauses[0] : { $or: clauses };
     };
     const parseProductFilter = (req) => {
       const searchText = typeof req.query.search === "string" ? req.query.search.trim() : "";
@@ -414,6 +570,7 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
           $or: [
             { name: { $regex: escaped, $options: "i" } },
             { category: { $regex: escaped, $options: "i" } },
+            { subcategory: { $regex: escaped, $options: "i" } },
             {
               $expr: {
                 $regexMatch: {
@@ -426,15 +583,8 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
           ],
         });
       }
-      const rawCategory = req.query.category;
-      const categoryInputs = Array.isArray(rawCategory) ? rawCategory : (rawCategory !== undefined ? [rawCategory] : []);
-      const categories = [];
-      for (const entry of categoryInputs) {
-        for (const part of String(entry).split(",")) {
-          const name = part.trim();
-          if (name) categories.push(name);
-        }
-      }
+      const categories = parseListFilter(req.query.category);
+      const subcategories = parseListFilter(req.query.subcategory);
       let minPrice = Number(Array.isArray(req.query.minPrice) ? req.query.minPrice[0] : req.query.minPrice);
       let maxPrice = Number(Array.isArray(req.query.maxPrice) ? req.query.maxPrice[0] : req.query.maxPrice);
       if (!Number.isFinite(minPrice)) minPrice = null;
@@ -458,18 +608,23 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
       return {
         searchText,
         categories,
+        subcategories,
         minPrice,
         maxPrice,
         inStock,
         sortKey,
         sort: PRODUCT_SORTS[sortKey],
-        query: andAll(categories.length > 0 ? [...baseAnd, { category: { $in: categories } }] : baseAnd),
+        query: andAll([
+          ...baseAnd,
+          ...(categories.length > 0 ? [matchList("category", categories)] : []),
+          ...(subcategories.length > 0 ? [matchList("subcategory", subcategories)] : []),
+        ]),
         facetQuery: andAll(baseAnd),
       };
     };
     app.get('/products', async (req, res) => {
       try {
-        const { query, facetQuery, sortKey, sort, categories, minPrice, maxPrice, inStock } = parseProductFilter(req);
+        const { query, facetQuery, sortKey, sort, categories, subcategories, minPrice, maxPrice, inStock } = parseProductFilter(req);
         const wantsPagination = req.query.page !== undefined || req.query.limit !== undefined;
         if (!wantsPagination) {
           const products = await productsCollection.find(query).sort(sort).toArray();
@@ -480,14 +635,19 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
         if (!Number.isInteger(page) || page < 1) page = 1;
         if (!Number.isInteger(limit) || limit < 1) limit = 20;
         limit = Math.min(limit, 100);
-        const [total, facetResult] = await Promise.all([
+        const [total, facetResult, categoryDocs] = await Promise.all([
           productsCollection.countDocuments(query),
           productsCollection.aggregate([
             { $match: facetQuery },
             {
               $facet: {
                 categories: [
-                  { $group: { _id: "$category", count: { $sum: 1 } } },
+                  {
+                    $group: {
+                      _id: { category: "$category", subcategory: { $ifNull: ["$subcategory", ""] } },
+                      count: { $sum: 1 },
+                    },
+                  },
                   { $sort: { count: -1 } },
                 ],
                 priceBounds: [
@@ -496,6 +656,7 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
               },
             },
           ]).toArray(),
+          categoriesCollection.find({}).toArray(),
         ]);
         const totalPages = Math.max(1, Math.ceil(total / limit));
         if (page > totalPages) page = totalPages;
@@ -506,6 +667,51 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
           .limit(limit)
           .toArray();
         const facets = facetResult?.[0] ?? { categories: [], priceBounds: [] };
+        // Resolve display names from the categories collection so facets read
+        // "Tea Table" while the client keeps filtering by slug.
+        const nameBySlug = new Map();
+        for (const doc of categoryDocs) {
+          nameBySlug.set(doc.slug, {
+            name: doc.name,
+            subcategories: new Map(
+              (Array.isArray(doc.subcategories) ? doc.subcategories : [])
+                .map((sub) => [slugifyCategory(sub?.slug ?? sub?.name ?? ""), sub?.name])
+                .filter(([slug]) => slug),
+            ),
+          });
+        }
+        const facetTree = new Map();
+        for (const row of facets.categories ?? []) {
+          const rawCategory = row._id?.category;
+          if (typeof rawCategory !== "string" || !rawCategory.trim()) continue;
+          const categorySlug = nameBySlug.has(rawCategory) ? rawCategory : slugifyCategory(rawCategory);
+          const meta = nameBySlug.get(categorySlug);
+          const entry = facetTree.get(categorySlug) ?? {
+            name: meta?.name ?? rawCategory,
+            slug: categorySlug,
+            count: 0,
+            subcategories: new Map(),
+          };
+          entry.count += row.count ?? 0;
+          const subSlug = slugifyCategory(row._id?.subcategory);
+          if (subSlug) {
+            const existing = entry.subcategories.get(subSlug);
+            entry.subcategories.set(subSlug, {
+              name: meta?.subcategories?.get(subSlug) ?? row._id.subcategory,
+              slug: subSlug,
+              count: (existing?.count ?? 0) + (row.count ?? 0),
+            });
+          }
+          facetTree.set(categorySlug, entry);
+        }
+        const facetCategories = [...facetTree.values()]
+          .map((entry) => ({
+            name: entry.name,
+            slug: entry.slug,
+            count: entry.count,
+            subcategories: [...entry.subcategories.values()].sort((a, b) => b.count - a.count),
+          }))
+          .sort((a, b) => b.count - a.count);
         return res.status(200).json({
           products,
           total,
@@ -513,12 +719,9 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
           limit,
           totalPages,
           sort: sortKey,
-          appliedFilters: { categories, minPrice, maxPrice, inStock },
+          appliedFilters: { categories, subcategories, minPrice, maxPrice, inStock },
           facets: {
-            categories: (facets.categories ?? []).map((c) => ({
-              name: c._id ?? "Uncategorized",
-              count: c.count ?? 0,
-            })),
+            categories: facetCategories,
             priceBounds: {
               min: Number(facets.priceBounds?.[0]?.min ?? 0),
               max: Number(facets.priceBounds?.[0]?.max ?? 0),
@@ -562,6 +765,10 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
 
         const { _id, ...fields } = req.body;
         const updateDoc = {};
+        const existing = await productsCollection.findOne({ _id: new ObjectId(id) });
+        if (!existing) {
+          return res.status(404).json({ error: "Product not found" });
+        }
 
         if ('images' in fields) {
           const imagesError = validateImages(fields.images);
@@ -598,9 +805,34 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
           updateDoc.stock = stock;
         }
 
+        // Hierarchy fields are resolved together so a sub-category change without
+        // an explicit category still validates against the product's parent.
+        if ('category' in fields || 'subcategory' in fields) {
+          const assignment = await resolveCategoryAssignment({
+            category: 'category' in fields ? fields.category : existing.category,
+            subcategory: 'subcategory' in fields ? fields.subcategory : existing.subcategory,
+          });
+          if (assignment.error) {
+            return res.status(400).json({ error: assignment.error });
+          }
+          updateDoc.category = assignment.value.category;
+          updateDoc.subcategory = assignment.value.subcategory;
+        }
+
+        const SKIP_FIELDS = ['_id', 'image', 'images', 'price', 'stock', 'category', 'subcategory', ...POLICY_FIELDS];
         for (const [key, value] of Object.entries(fields)) {
-          if (['_id', 'image', 'images', 'price', 'stock'].includes(key)) continue;
+          if (SKIP_FIELDS.includes(key)) continue;
           updateDoc[key] = value;
+        }
+
+        for (const field of POLICY_FIELDS) {
+          if (field in fields) {
+            const check = normalizePolicyField(fields[field]);
+            if (check.error) {
+              return res.status(400).json({ error: `${field} ${check.error}` });
+            }
+            updateDoc[field] = check.value;
+          }
         }
 
         if (Object.keys(updateDoc).length === 0) {
@@ -639,6 +871,339 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
       } catch (error) {
         console.error("Error deleting product:", error);
         res.status(500).json({ error: "Failed to delete product" });
+      }
+    })
+
+    //Category APIs
+    // GET /categories (public): full tree with per-level product counts.
+    const loadCategoryTree = async () => {
+      const categories = await categoriesCollection.find({}).sort({ name: 1 }).toArray();
+      const rows = await productsCollection.aggregate([
+        {
+          $group: {
+            _id: { category: "$category", subcategory: { $ifNull: ["$subcategory", ""] } },
+            count: { $sum: 1 },
+          },
+        },
+      ]).toArray();
+
+      const tree = categories.map((doc) => ({
+        _id: doc._id,
+        name: doc.name,
+        slug: doc.slug,
+        image: isValidUrl(doc.image) ? doc.image : null,
+        productCount: 0,
+        subcategories: (Array.isArray(doc.subcategories) ? doc.subcategories : [])
+          .map(normalizeSubcategory)
+          .sort((a, b) => a.name.localeCompare(b.name))
+          .map((sub) => ({
+            _id: sub._id,
+            name: sub.name,
+            slug: sub.slug,
+            image: sub.image,
+            productCount: 0,
+          })),
+      }));
+
+      const bySlug = new Map(tree.map((entry) => [entry.slug, entry]));
+      let unassignedCount = 0;
+      for (const row of rows) {
+        const rawCategory = row._id?.category;
+        const count = row.count ?? 0;
+        if (typeof rawCategory !== "string" || !rawCategory.trim()) {
+          unassignedCount += count;
+          continue;
+        }
+        // Products created before categories existed may store a display name
+        // rather than a slug, so fall back to slugifying the stored value.
+        const parent = bySlug.get(rawCategory) ?? bySlug.get(slugifyCategory(rawCategory));
+        if (!parent) {
+          unassignedCount += count;
+          continue;
+        }
+        parent.productCount += count;
+        const subSlug = slugifyCategory(row._id?.subcategory);
+        if (!subSlug) continue;
+        const sub = parent.subcategories.find((entry) => entry.slug === subSlug);
+        if (sub) {
+          sub.productCount += count;
+        } else {
+          parent.productCount -= count;
+          unassignedCount += count;
+        }
+      }
+
+      return { tree, unassignedCount };
+    };
+
+    const loadCategoryDoc = async (id) => {
+      if (!ObjectId.isValid(id)) return { error: "Invalid category id", status: 400 };
+      const doc = await categoriesCollection.findOne({ _id: new ObjectId(id) });
+      if (!doc) return { error: "Category not found", status: 404 };
+      return { doc };
+    };
+
+    app.get('/categories', async (req, res) => {
+      try {
+        const { tree, unassignedCount } = await loadCategoryTree();
+        res.status(200).json({ categories: tree, unassignedCount });
+      } catch (error) {
+        console.error("Error fetching categories:", error);
+        res.status(500).json({ error: "Failed to fetch categories" });
+      }
+    })
+
+    //Create Category API (admin only)
+    app.post('/categories', verifyToken, requireAdmin, async (req, res) => {
+      try {
+        const nameCheck = validateCategoryName(req.body?.name);
+        if (nameCheck.error) {
+          return res.status(400).json({ error: nameCheck.error });
+        }
+        const imageCheck = validateCategoryImage(req.body?.image);
+        if (imageCheck.error) {
+          return res.status(400).json({ error: imageCheck.error });
+        }
+        const { name, slug } = nameCheck.value;
+        const existing = await categoriesCollection.findOne({ slug });
+        if (existing) {
+          return res.status(409).json({ error: `A category named "${name}" already exists` });
+        }
+        const now = new Date();
+        const doc = {
+          name,
+          slug,
+          image: imageCheck.value ?? null,
+          subcategories: [],
+          createdAt: now,
+          updatedAt: now,
+        };
+        const result = await categoriesCollection.insertOne(doc);
+        res.status(201).json({ ...doc, _id: result.insertedId });
+      } catch (error) {
+        if (isDuplicateKeyError(error)) {
+          return res.status(409).json({ error: "A category with that name already exists" });
+        }
+        console.error("Error creating category:", error);
+        res.status(500).json({ error: "Failed to create category" });
+      }
+    })
+
+    //Update Category API (admin only) — renaming re-slugs products too.
+    app.patch('/categories/:id', verifyToken, requireAdmin, async (req, res) => {
+      try {
+        const { doc, error, status } = await loadCategoryDoc(req.params.id);
+        if (error) return res.status(status).json({ error });
+
+        const updateDoc = { updatedAt: new Date() };
+        let renamedFrom = null;
+
+        if ('name' in (req.body ?? {})) {
+          const nameCheck = validateCategoryName(req.body.name);
+          if (nameCheck.error) {
+            return res.status(400).json({ error: nameCheck.error });
+          }
+          const { name, slug } = nameCheck.value;
+          if (slug !== doc.slug) {
+            const clash = await categoriesCollection.findOne({ slug, _id: { $ne: doc._id } });
+            if (clash) {
+              return res.status(409).json({ error: `A category named "${name}" already exists` });
+            }
+            renamedFrom = doc.slug;
+          }
+          updateDoc.name = name;
+          updateDoc.slug = slug;
+        }
+
+        if ('image' in (req.body ?? {})) {
+          const imageCheck = validateCategoryImage(req.body.image);
+          if (imageCheck.error) {
+            return res.status(400).json({ error: imageCheck.error });
+          }
+          updateDoc.image = imageCheck.value;
+        }
+
+        if (Object.keys(updateDoc).length === 1) {
+          return res.status(400).json({ error: "No fields to update" });
+        }
+
+        await categoriesCollection.updateOne({ _id: doc._id }, { $set: updateDoc });
+        if (renamedFrom) {
+          await productsCollection.updateMany(
+            { category: renamedFrom },
+            { $set: { category: updateDoc.slug, updatedAt: new Date() } }
+          );
+        }
+
+        const updated = await categoriesCollection.findOne({ _id: doc._id });
+        res.status(200).json(updated);
+      } catch (error) {
+        if (isDuplicateKeyError(error)) {
+          return res.status(409).json({ error: "A category with that name already exists" });
+        }
+        console.error("Error updating category:", error);
+        res.status(500).json({ error: "Failed to update category" });
+      }
+    })
+
+    //Delete Category API (admin only) — blocked while products still use it.
+    app.delete('/categories/:id', verifyToken, requireAdmin, async (req, res) => {
+      try {
+        const { doc, error, status } = await loadCategoryDoc(req.params.id);
+        if (error) return res.status(status).json({ error });
+
+        const productCount = await productsCollection.countDocuments({ category: doc.slug });
+        if (productCount > 0) {
+          return res.status(400).json({
+            error: `Move or delete the ${productCount} product(s) in this category first`,
+            productCount,
+          });
+        }
+
+        await categoriesCollection.deleteOne({ _id: doc._id });
+        res.status(200).json({ success: true, deletedId: req.params.id });
+      } catch (error) {
+        console.error("Error deleting category:", error);
+        res.status(500).json({ error: "Failed to delete category" });
+      }
+    })
+
+    //Create Sub-category API (admin only)
+    app.post('/categories/:id/subcategories', verifyToken, requireAdmin, async (req, res) => {
+      try {
+        const { doc, error, status } = await loadCategoryDoc(req.params.id);
+        if (error) return res.status(status).json({ error });
+
+        const nameCheck = validateCategoryName(req.body?.name);
+        if (nameCheck.error) {
+          return res.status(400).json({ error: nameCheck.error });
+        }
+        const imageCheck = validateCategoryImage(req.body?.image);
+        if (imageCheck.error) {
+          return res.status(400).json({ error: imageCheck.error });
+        }
+        const { name, slug } = nameCheck.value;
+        if (findSubcategory(doc, slug)) {
+          return res.status(409).json({
+            error: `"${name}" already exists in ${doc.name}`,
+          });
+        }
+
+        const sub = normalizeSubcategory({ name, slug, image: imageCheck.value ?? null });
+        await categoriesCollection.updateOne(
+          { _id: doc._id },
+          { $push: { subcategories: sub }, $set: { updatedAt: new Date() } }
+        );
+        res.status(201).json(sub);
+      } catch (error) {
+        console.error("Error creating sub-category:", error);
+        res.status(500).json({ error: "Failed to create sub-category" });
+      }
+    })
+
+    //Update Sub-category API (admin only)
+    app.patch('/categories/:id/subcategories/:subId', verifyToken, requireAdmin, async (req, res) => {
+      try {
+        const { doc, error, status } = await loadCategoryDoc(req.params.id);
+        if (error) return res.status(status).json({ error });
+
+        const { subId } = req.params;
+        if (!ObjectId.isValid(subId)) {
+          return res.status(400).json({ error: "Invalid sub-category id" });
+        }
+        const current = findSubcategory(doc, subId);
+        if (!current) {
+          return res.status(404).json({ error: "Sub-category not found" });
+        }
+
+        const setFields = { "subcategories.$.updatedAt": new Date() };
+        let renamedFrom = null;
+        let renamedTo = null;
+
+        if ('name' in (req.body ?? {})) {
+          const nameCheck = validateCategoryName(req.body.name);
+          if (nameCheck.error) {
+            return res.status(400).json({ error: nameCheck.error });
+          }
+          const { name, slug } = nameCheck.value;
+          const clash = findSubcategory(doc, slug);
+          if (clash && String(clash._id) !== String(current._id)) {
+            return res.status(409).json({ error: `"${name}" already exists in ${doc.name}` });
+          }
+          if (slug !== current.slug) {
+            renamedFrom = current.slug;
+            renamedTo = slug;
+          }
+          setFields["subcategories.$.name"] = name;
+          setFields["subcategories.$.slug"] = slug;
+        }
+
+        if ('image' in (req.body ?? {})) {
+          const imageCheck = validateCategoryImage(req.body.image);
+          if (imageCheck.error) {
+            return res.status(400).json({ error: imageCheck.error });
+          }
+          setFields["subcategories.$.image"] = imageCheck.value;
+        }
+
+        if (Object.keys(setFields).length === 1) {
+          return res.status(400).json({ error: "No fields to update" });
+        }
+
+        await categoriesCollection.updateOne(
+          { _id: doc._id },
+          { $set: setFields },
+          { arrayFilters: [{ "subcategories._id": new ObjectId(subId) }] }
+        );
+        if (renamedFrom) {
+          await productsCollection.updateMany(
+            { category: doc.slug, subcategory: renamedFrom },
+            { $set: { subcategory: renamedTo, updatedAt: new Date() } }
+          );
+        }
+
+        const updated = await categoriesCollection.findOne({ _id: doc._id });
+        res.status(200).json(findSubcategory(updated, subId));
+      } catch (error) {
+        console.error("Error updating sub-category:", error);
+        res.status(500).json({ error: "Failed to update sub-category" });
+      }
+    })
+
+    //Delete Sub-category API (admin only)
+    app.delete('/categories/:id/subcategories/:subId', verifyToken, requireAdmin, async (req, res) => {
+      try {
+        const { doc, error, status } = await loadCategoryDoc(req.params.id);
+        if (error) return res.status(status).json({ error });
+
+        const { subId } = req.params;
+        if (!ObjectId.isValid(subId)) {
+          return res.status(400).json({ error: "Invalid sub-category id" });
+        }
+        const current = findSubcategory(doc, subId);
+        if (!current) {
+          return res.status(404).json({ error: "Sub-category not found" });
+        }
+
+        const productCount = await productsCollection.countDocuments({
+          category: doc.slug,
+          subcategory: current.slug,
+        });
+        if (productCount > 0) {
+          return res.status(400).json({
+            error: `Move or delete the ${productCount} product(s) in this sub-category first`,
+            productCount,
+          });
+        }
+
+        await categoriesCollection.updateOne(
+          { _id: doc._id },
+          { $pull: { subcategories: { _id: new ObjectId(subId) } }, $set: { updatedAt: new Date() } }
+        );
+        res.status(200).json({ success: true, deletedId: subId });
+      } catch (error) {
+        console.error("Error deleting sub-category:", error);
+        res.status(500).json({ error: "Failed to delete sub-category" });
       }
     })
 
@@ -824,6 +1389,48 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
         res.status(500).json({ error: "Failed to fetch orders" });
       }
     });
+
+    //Bulk assign category API (admin only)
+    app.patch('/products/category/bulk', verifyToken, requireAdmin, async (req, res) => {
+      try {
+        const rawIds = req.body?.productIds;
+        if (!Array.isArray(rawIds) || rawIds.length === 0) {
+          return res.status(400).json({ error: "productIds must be a non-empty array" });
+        }
+        if (rawIds.length > 500) {
+          return res.status(400).json({ error: "at most 500 products can be updated at once" });
+        }
+        const ids = [];
+        for (const entry of rawIds) {
+          const id = typeof entry === "string" ? entry.trim() : "";
+          if (!ObjectId.isValid(id)) {
+            return res.status(400).json({ error: `invalid productId: ${entry}` });
+          }
+          ids.push(new ObjectId(id));
+        }
+
+        const assignment = await resolveCategoryAssignment(req.body);
+        if (assignment.error) {
+          return res.status(400).json({ error: assignment.error });
+        }
+        const { category, subcategory } = assignment.value;
+
+        const result = await productsCollection.updateMany(
+          { _id: { $in: ids } },
+          { $set: { category, subcategory, updatedAt: new Date() } }
+        );
+        res.status(200).json({
+          success: true,
+          matchedCount: result.matchedCount,
+          modifiedCount: result.modifiedCount,
+          category,
+          subcategory,
+        });
+      } catch (error) {
+        console.error("Error bulk assigning category:", error);
+        res.status(500).json({ error: "Failed to update products" });
+      }
+    })
 
     //Update Order API (admin full access; customers may only cancel their own pending orders)
     app.patch('/orders/:id', verifyToken, async (req, res) => {
@@ -1204,9 +1811,90 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
 // }
 // run().catch(console.dir);
 
-app.get('/', (req, res) => {
-  res.send('Hello World!');
-});
+// Starter taxonomy. Admin can edit or extend all of it afterwards.
+    const STARTER_CATEGORIES = [
+      { name: "Swing Chair", subcategories: ["Hanging Swing Chair", "Swing Chair with Stand", "Baby Swing Chair"] },
+      { name: "Furniture", subcategories: ["Chair Table Set", "Tea Table", "Mirror", "Dressing Table"] },
+      { name: "Women's", subcategories: ["Sarees", "3 Piece", "Kurti", "Jewellery", "Cosmetics"] },
+      { name: "Others", subcategories: [] },
+    ];
+
+    //Seed starter categories (admin only, idempotent — never overwrites)
+    app.post('/admin/seed-categories', verifyToken, requireAdmin, async (req, res) => {
+      try {
+        const now = new Date();
+        const created = [];
+        const skipped = [];
+        for (const entry of STARTER_CATEGORIES) {
+          const slug = slugifyCategory(entry.name);
+          const existing = await categoriesCollection.findOne({ slug });
+          if (existing) {
+            skipped.push(slug);
+            continue;
+          }
+          const doc = {
+            name: entry.name,
+            slug,
+            image: null,
+            subcategories: entry.subcategories.map((subName) => normalizeSubcategory({
+              name: subName,
+              slug: slugifyCategory(subName),
+              image: null,
+            })),
+            createdAt: now,
+            updatedAt: now,
+          };
+          await categoriesCollection.insertOne(doc);
+          created.push(slug);
+        }
+        res.status(200).json({ success: true, created, skipped });
+      } catch (error) {
+        console.error("Error seeding categories:", error);
+        res.status(500).json({ error: "Failed to seed categories" });
+      }
+    })
+
+    //Migrate legacy free-text product categories onto slugs (admin only, idempotent)
+    app.post('/admin/migrate-product-categories', verifyToken, requireAdmin, async (req, res) => {
+      try {
+        const { tree } = await loadCategoryTree();
+        const bySlug = new Map(tree.map((entry) => [entry.slug, entry]));
+        const products = await productsCollection.find({}).toArray();
+        let updatedProducts = 0;
+        const unmapped = new Map();
+        for (const product of products) {
+          const parentSlug = slugifyCategory(product?.category);
+          const parent = bySlug.get(parentSlug);
+          if (!parent) {
+            const key = String(product?.category ?? "(none)");
+            unmapped.set(key, (unmapped.get(key) ?? 0) + 1);
+            continue;
+          }
+          const subSlug = slugifyCategory(product?.subcategory);
+          const sub = parent.subcategories.find((entry) => entry.slug === subSlug);
+          const nextCategory = parent.slug;
+          const nextSub = sub ? sub.slug : "";
+          if (product.category === nextCategory && String(product.subcategory ?? "") === nextSub) continue;
+          await productsCollection.updateOne(
+            { _id: product._id },
+            { $set: { category: nextCategory, subcategory: nextSub, updatedAt: new Date() } }
+          );
+          updatedProducts += 1;
+        }
+        res.status(200).json({
+          success: true,
+          updatedProducts,
+          unmapped: [...unmapped.entries()].map(([category, count]) => ({ category, count })),
+        });
+      } catch (error) {
+        console.error("Error migrating product categories:", error);
+        res.status(500).json({ error: "Failed to migrate product categories" });
+      }
+    })
+
+    app.get('/', (req, res) => {
+      res.send('Hello World!');
+    });
 
 app.listen(port, () => {
   console.log(`Example app listening on port ${port}`);
