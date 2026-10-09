@@ -517,12 +517,6 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
 
 
     //Get Products API
-    // Supports server-side pagination: pass ?page=&limit= to receive
-    // { products, total, page, limit, totalPages, sort, facets }. Without pagination params
-    // the legacy bare array is returned. Optional filters (combinable):
-    // ?search= (name, category, subcategory, price), ?category= and ?subcategory=
-    // (repeatable, comma-separated), ?minPrice=&maxPrice=,
-    // ?inStock=true, ?sort=newest|price-asc|price-desc|name
     const PRODUCT_SORTS = {
       "newest": { _id: -1 },
       "price-asc": { price: 1, _id: -1 },
@@ -1346,6 +1340,20 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
             orClauses.push({ _id: new ObjectId(q) });
           }
           filter.$or = orClauses;
+        }
+        // Single-day filter: ?date=YYYY-MM-DD (Asia/Dhaka business day)
+        const rawDate = typeof req.query.date === "string" ? req.query.date.trim() : "";
+        if (rawDate) {
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
+            return res.status(400).json({ error: "date must be YYYY-MM-DD" });
+          }
+          const dateParts = rawDate.split("-").map(Number);
+          const start = new Date(Date.UTC(dateParts[0], dateParts[1] - 1, dateParts[2], -6, 0, 0, 0));
+          if (Number.isNaN(start.getTime())) {
+            return res.status(400).json({ error: "date must be YYYY-MM-DD" });
+          }
+          const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+          filter.createdAt = { $gte: start, $lt: end };
         }
         const wantsPagination = req.query.page !== undefined || req.query.limit !== undefined;
         if (!wantsPagination) {
