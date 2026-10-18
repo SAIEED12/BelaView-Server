@@ -17,7 +17,6 @@ const port = process.env.port || 5000;
 const MAX_IMAGES = 4;
 const DEFAULT_DELIVERY_CHARGE = 60;
 const ORDER_STATUSES = ["pending", "confirmed", "shipped", "delivered", "cancelled"];
-const FINAL_ORDER_STATUSES = ["delivered", "cancelled"];
 
 const isValidUrl = (value) => {
   if (typeof value !== "string" || !value.trim()) return false;
@@ -85,6 +84,53 @@ const normalizePolicyField = (raw) => {
     return { error: `must be at most ${MAX_POLICY_LEN} characters` };
   }
   return { value };
+};
+
+// SIZE
+const MAX_SIZES = 30;
+const MAX_SIZE_LEN = 16;
+
+const normalizeSizes = (raw) => {
+  if (raw === undefined) return { value: undefined };
+  if (raw === null || raw === "") return { value: [] };
+  let list;
+  if (Array.isArray(raw)) {
+    list = raw;
+  } else if (typeof raw === "string") {
+    list = raw.split(",");
+  } else {
+    return { error: "must be an array or a comma-separated string" };
+  }
+  const sizes = [];
+  for (const entry of list) {
+    if (typeof entry !== "string" && typeof entry !== "number") {
+      return { error: "each size must be a string" };
+    }
+    const token = String(entry).trim();
+    if (!token) continue;
+    if (token.length > MAX_SIZE_LEN) {
+      return { error: `each size must be at most ${MAX_SIZE_LEN} characters` };
+    }
+    // ":" would collide with the client cart line separator (productId::size).
+    if (token.includes(":")) {
+      return { error: `size "${token}" cannot contain ":"` };
+    }
+    if (!sizes.includes(token)) sizes.push(token);
+  }
+  if (sizes.length > MAX_SIZES) {
+    return { error: `can hold at most ${MAX_SIZES} entries` };
+  }
+  return { value: sizes };
+};
+
+const normalizeOrderItemSize = (raw) => {
+  if (raw === undefined || raw === null) return { value: "" };
+  if (typeof raw !== "string") return { error: "must be a string" };
+  const size = raw.trim();
+  if (size.length > MAX_SIZE_LEN) {
+    return { error: `must be at most ${MAX_SIZE_LEN} characters` };
+  }
+  return { value: size };
 };
 
 // Sub-categories 
@@ -180,7 +226,13 @@ const validateOrder = (body) => {
     if (!Number.isInteger(quantity) || quantity <= 0) {
       return { error: `quantity for product ${productId} must be a positive integer` };
     }
-    items.push({ productId, quantity });
+
+    const sizeCheck = normalizeOrderItemSize(entry.size);
+    if (sizeCheck.error) {
+      return { error: `size for product ${productId} ${sizeCheck.error}` };
+    }
+
+    items.push({ productId, quantity, size: sizeCheck.value });
   }
 
   // COD only: default to cod, reject anything else
@@ -236,7 +288,7 @@ const validateOrderPatch = (body) => {
     return { error: "order update body must be an object" };
   }
 
-  const IMMUTABLE = ["_id", "userId", "paymentMethod", "totalAmount", "subtotal", "itemCount", "createdAt"];
+  const IMMUTABLE = ["_id", "userId", "paymentMethod", "subtotal", "itemCount", "createdAt"];
   for (const key of IMMUTABLE) {
     if (key in body) {
       return { error: `${key} cannot be updated` };
@@ -288,6 +340,15 @@ const validateOrderPatch = (body) => {
     hasField = true;
   }
 
+  if ("totalAmount" in body) {
+    const totalAmount = Number(body.totalAmount);
+    if (!Number.isFinite(totalAmount) || totalAmount < 0) {
+      return { error: "totalAmount must be a number >= 0" };
+    }
+    value.totalAmount = totalAmount;
+    hasField = true;
+  }
+
   if ("orderStatus" in body) {
     const orderStatus = typeof body.orderStatus === "string" ? body.orderStatus.trim().toLowerCase() : "";
     if (!ORDER_STATUSES.includes(orderStatus)) {
@@ -319,7 +380,13 @@ const validateOrderPatch = (body) => {
       if (!Number.isInteger(quantity) || quantity <= 0) {
         return { error: `quantity for product ${productId} must be a positive integer` };
       }
-      items.push({ productId, quantity });
+
+      const sizeCheck = normalizeOrderItemSize(entry.size);
+      if (sizeCheck.error) {
+        return { error: `size for product ${productId} ${sizeCheck.error}` };
+      }
+
+      items.push({ productId, quantity, size: sizeCheck.value });
     }
     value.items = items;
     hasField = true;
@@ -498,6 +565,11 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
           if (check.value !== undefined) policies[field] = check.value;
         }
 
+        const sizesCheck = normalizeSizes(product.sizes);
+        if (sizesCheck.error) {
+          return res.status(400).json({ error: `sizes ${sizesCheck.error}` });
+        }
+
         const result = await productsCollection.insertOne({
           ...product,
           ...policies,
@@ -505,6 +577,7 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
           subcategory,
           image,
           images,
+          sizes: sizesCheck.value ?? [],
           price: Number(product.price),
           stock: Number(product.stock),
         });
@@ -799,6 +872,14 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
           updateDoc.stock = stock;
         }
 
+        if ('sizes' in fields) {
+          const sizesCheck = normalizeSizes(fields.sizes);
+          if (sizesCheck.error) {
+            return res.status(400).json({ error: `sizes ${sizesCheck.error}` });
+          }
+          updateDoc.sizes = sizesCheck.value ?? [];
+        }
+
         // Hierarchy fields are resolved together so a sub-category change without
         // an explicit category still validates against the product's parent.
         if ('category' in fields || 'subcategory' in fields) {
@@ -813,7 +894,7 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
           updateDoc.subcategory = assignment.value.subcategory;
         }
 
-        const SKIP_FIELDS = ['_id', 'image', 'images', 'price', 'stock', 'category', 'subcategory', ...POLICY_FIELDS];
+        const SKIP_FIELDS = ['_id', 'image', 'images', 'price', 'stock', 'sizes', 'category', 'subcategory', ...POLICY_FIELDS];
         for (const [key, value] of Object.entries(fields)) {
           if (SKIP_FIELDS.includes(key)) continue;
           updateDoc[key] = value;
@@ -1228,6 +1309,18 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
           if (!product) {
             return res.status(404).json({ error: `Product not found: ${item.productId}` });
           }
+          // Products with a size list require one of those sizes per item.
+          const productSizes = Array.isArray(product.sizes) ? product.sizes.filter(Boolean) : [];
+          if (productSizes.length > 0) {
+            if (!item.size) {
+              return res.status(400).json({ error: `size is required for product: ${item.productId}` });
+            }
+            if (!productSizes.includes(item.size)) {
+              return res.status(400).json({ error: `size "${item.size}" is not available for product: ${item.productId}` });
+            }
+          } else {
+            item.size = "";
+          }
           const stock = Number(product.stock);
           if (!Number.isFinite(stock) || stock < item.quantity) {
             return res.status(400).json({ error: `Insufficient stock for product: ${item.productId}` });
@@ -1243,6 +1336,7 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
             image: product.image || "",
             unitPrice,
             quantity: item.quantity,
+            size: item.size || "",
             subtotal: unitPrice * item.quantity,
           };
         });
@@ -1258,6 +1352,7 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
           subtotal,
           deliveryCharge: value.deliveryCharge,
           totalAmount,
+          totalOverridden: false,
           paymentMethod: "cod",
           orderStatus: "pending",
           note: value.note,
@@ -1472,11 +1567,6 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
           }
         }
 
-        const isFinal = FINAL_ORDER_STATUSES.includes(existing.orderStatus);
-        const wantsDataChange = ("customer" in value) || ("note" in value) || ("deliveryCharge" in value) || ("items" in value);
-        if (isFinal && wantsDataChange) {
-          return res.status(400).json({ error: `Order is ${existing.orderStatus} and cannot be edited` });
-        }
         if (existing.orderStatus === "delivered" && value.orderStatus === "cancelled") {
           return res.status(400).json({ error: "Delivered order cannot be cancelled" });
         }
@@ -1491,7 +1581,7 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
         if ("items" in value) {
           const oldMap = new Map((existing.items || []).map((it) => [
             it.productId.toString(),
-            { quantity: it.quantity, unitPrice: it.unitPrice, title: it.title, image: it.image },
+            { quantity: it.quantity, unitPrice: it.unitPrice, title: it.title, image: it.image, size: it.size || "" },
           ]));
           const newIds = value.items.map((it) => new ObjectId(it.productId));
           const products = await productsCollection.find({ _id: { $in: newIds } }).toArray();
@@ -1512,6 +1602,7 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
                 image: old.image || "",
                 unitPrice: old.unitPrice,
                 quantity: it.quantity,
+                size: it.size || old.size || "",
                 subtotal: old.unitPrice * it.quantity,
               };
             }
@@ -1523,6 +1614,7 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
               image: product.image || "",
               unitPrice,
               quantity: it.quantity,
+              size: it.size || "",
               subtotal: unitPrice * it.quantity,
             };
           });
@@ -1530,7 +1622,19 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
 
         const subtotal = finalItems.reduce((sum, it) => sum + it.subtotal, 0);
         const itemCount = finalItems.reduce((sum, it) => sum + it.quantity, 0);
-        const totalAmount = subtotal + newDeliveryCharge;
+        const calculatedTotal = subtotal + newDeliveryCharge;
+        // Admins may override the order total (e.g. a negotiated price). When the
+        // patch omits totalAmount, an existing override is preserved so status-only
+        // updates never wipe it.
+        let totalAmount = calculatedTotal;
+        let totalOverridden = false;
+        if ("totalAmount" in value) {
+          totalAmount = value.totalAmount;
+          totalOverridden = Math.abs(totalAmount - calculatedTotal) > 0.009;
+        } else if (existing.totalOverridden) {
+          totalAmount = Number(existing.totalAmount ?? calculatedTotal);
+          totalOverridden = true;
+        }
 
         // Stock adjustments
         const oldQty = new Map((existing.items || []).map((it) => [it.productId.toString(), it.quantity]));
@@ -1539,7 +1643,10 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
         const isReopening = existing.orderStatus === "cancelled" && newStatus !== "cancelled";
 
         const deltas = new Map();
-        if ("items" in value && !isCancelling && !isReopening) {
+        // A cancelled order keeps its stock restored; editing its items while it
+        // stays cancelled must not move stock. Reopening/cancelling is handled above.
+        const staysCancelled = existing.orderStatus === "cancelled" && newStatus === "cancelled";
+        if ("items" in value && !isCancelling && !isReopening && !staysCancelled) {
           const allIds = new Set([...oldQty.keys(), ...newQty.keys()]);
           for (const pid of allIds) {
             const d = (newQty.get(pid) || 0) - (oldQty.get(pid) || 0);
@@ -1574,6 +1681,7 @@ const requireOwnerOrAdmin = (getUserId) => (req, res, next) => {
                   subtotal,
                   deliveryCharge: newDeliveryCharge,
                   totalAmount,
+                  totalOverridden,
                   orderStatus: newStatus,
                   note: newNote,
                   updatedAt: new Date(),
