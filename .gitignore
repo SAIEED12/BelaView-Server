@@ -1,3 +1,6 @@
 .env
 node_modules
 .vercel
+public/uploads/*
+!public/uploads/.gitkeep
+belaview-server-cpanel.zip
