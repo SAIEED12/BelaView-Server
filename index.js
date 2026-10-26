@@ -72,6 +72,44 @@ const slugifyCategory = (value) => {
     .replace(/^-|-$/g, "");
 };
 
+// Product URLs use the same "name with dashes" shape as categories. The slug
+// is stored on each product row (unique) so /products/:slug can resolve it
+// without scanning the table.
+const slugifyProduct = (value) => slugifyCategory(value);
+
+// Keeps the stored slug (and the -2, -3 suffix) inside the varchar(255) column.
+const MAX_PRODUCT_SLUG = 180;
+
+const productSlugBase = (name, fallbackId = "") => {
+  let base = slugifyProduct(name);
+  if (base.length > MAX_PRODUCT_SLUG) {
+    base = base.slice(0, MAX_PRODUCT_SLUG).replace(/-+$/, "");
+  }
+  if (base) return base;
+  const suffix = String(fallbackId ?? "").trim().toLowerCase();
+  return suffix ? `product-${suffix}` : "product";
+};
+
+// Returns a slug that no other product owns. Duplicate names get -2, -3, ...
+// `excludeId` lets an update keep (or re-derive) its own slug.
+const uniqueProductSlug = async (name, { excludeId = "", fallbackId = "" } = {}) => {
+  const base = productSlugBase(name, fallbackId || excludeId);
+  const params = [base, `${base}-%`];
+  let sql = "SELECT slug FROM products WHERE (slug = ? OR slug LIKE ?)";
+  if (excludeId) {
+    sql += " AND `_id` <> ?";
+    params.push(normalizeHexId(excludeId));
+  }
+  const [rows] = await pool.query(sql, params);
+  const taken = new Set(rows.map((row) => row.slug));
+  if (!taken.has(base)) return base;
+  for (let suffix = 2; suffix < 10000; suffix += 1) {
+    const candidate = `${base}-${suffix}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  return `${base}-${String(fallbackId || Date.now()).slice(-6).toLowerCase()}`;
+};
+
 const validateCategoryName = (raw) => {
   const name = typeof raw === "string" ? raw.trim() : "";
   if (!name) return { error: "name is required" };
@@ -241,6 +279,7 @@ const buildWhere = (clauses) => {
 
 const rowToProduct = (row) => ({
   _id: row._id,
+  slug: row.slug ?? "",
   name: row.name ?? "",
   description: row.description ?? "",
   price: Number(row.price ?? 0),
@@ -310,6 +349,7 @@ const rowToReview = (row) => ({
 const rowToAdminReview = (row) => ({
   ...rowToReview(row),
   productName: row.productName ?? "",
+  productSlug: row.productSlug ?? "",
   userEmail: row.userEmail ?? "",
 });
 
@@ -770,16 +810,20 @@ app.post("/add-products", verifyToken, requireAdmin, async (req, res) => {
     const stock = Number(product.stock);
     const now = new Date();
     const id = newId();
+    const name =
+      typeof product.name === "string" ? product.name : String(product.name ?? "");
+    const slug = await uniqueProductSlug(name, { fallbackId: id });
 
     await pool.query(
       `INSERT INTO products
-        (\`_id\`, name, description, price, stock, category, subcategory,
+        (\`_id\`, slug, name, description, price, stock, category, subcategory,
          image, \`images\`, sizes, disclaimer, note, deliveryPayment, returnPolicy,
          createdAt, updatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
-        typeof product.name === "string" ? product.name : String(product.name ?? ""),
+        slug,
+        name,
         typeof product.description === "string" ? product.description : null,
         Number.isFinite(price) ? price : 0,
         Number.isFinite(stock) ? stock : 0,
@@ -796,7 +840,7 @@ app.post("/add-products", verifyToken, requireAdmin, async (req, res) => {
         now,
       ],
     );
-    res.status(201).json({ acknowledged: true, insertedId: id });
+    res.status(201).json({ acknowledged: true, insertedId: id, slug });
   } catch (error) {
     console.error("Error adding product:", error);
     res.status(500).json({ error: "Failed to add product" });
@@ -1011,18 +1055,35 @@ app.get("/products", async (req, res) => {
 });
 
 //Products Details API
+// Resolves either the legacy hex _id or the stored slug, so old
+// /products/<id> links keep working while new links use /products/<slug>.
+const findProductRow = async (param) => {
+  const raw = String(param ?? "").trim();
+  if (!raw) return null;
+  if (isHexId(raw)) {
+    const [rows] = await pool.query(
+      "SELECT * FROM products WHERE `_id` = ? LIMIT 1",
+      [normalizeHexId(raw)],
+    );
+    return rows[0] ?? null;
+  }
+  const slug = slugifyProduct(raw);
+  if (!slug) return null;
+  const [rows] = await pool.query(
+    "SELECT * FROM products WHERE slug = ? LIMIT 1",
+    [slug],
+  );
+  return rows[0] ?? null;
+};
+
 app.get("/products/:id", async (req, res) => {
   try {
-    const { id } = req.params;
-    if (!isHexId(id)) {
-      return res.status(400).json({ error: "Invalid product id" });
-    }
-    const [rows] = await pool.query("SELECT * FROM products WHERE `_id` = ? LIMIT 1", [normalizeHexId(id)]);
-    if (!rows[0]) {
+    const row = await findProductRow(req.params.id);
+    if (!row) {
       return res.status(404).json({ error: "Product not found" });
     }
-    const product = rowToProduct(rows[0]);
-    const summary = await getProductRatingSummary(normalizeHexId(id));
+    const product = rowToProduct(row);
+    const summary = await getProductRatingSummary(product._id);
     res.status(200).json({
       ...product,
       ratingAvg: summary.average,
@@ -1043,18 +1104,11 @@ app.get("/products/:id", async (req, res) => {
 // Public: review list + aggregate for a product page.
 app.get("/products/:id/reviews", async (req, res) => {
   try {
-    const { id } = req.params;
-    if (!isHexId(id)) {
-      return res.status(400).json({ error: "Invalid product id" });
-    }
-    const productId = normalizeHexId(id);
-    const [productRows] = await pool.query(
-      "SELECT `_id` FROM products WHERE `_id` = ? LIMIT 1",
-      [productId],
-    );
-    if (!productRows[0]) {
+    const productRow = await findProductRow(req.params.id);
+    if (!productRow) {
       return res.status(404).json({ error: "Product not found" });
     }
+    const productId = productRow._id;
 
     let page = Number.parseInt(Array.isArray(req.query.page) ? req.query.page[0] : req.query.page, 10);
     let limit = Number.parseInt(Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit, 10);
@@ -1240,7 +1294,7 @@ app.get("/admin/reviews", verifyToken, requireAdmin, async (req, res) => {
     if (page > totalPages) page = totalPages;
 
     const [rows] = await pool.query(
-      `SELECT r.*, u.name AS userName, u.email AS userEmail, p.name AS productName
+      `SELECT r.*, u.name AS userName, u.email AS userEmail, p.name AS productName, p.slug AS productSlug
          FROM reviews r
          LEFT JOIN \`user\` u ON u.id = r.userId
          LEFT JOIN products p ON p._id = r.productId
@@ -1287,7 +1341,7 @@ app.patch("/admin/reviews/:id", verifyToken, requireAdmin, async (req, res) => {
       return res.status(404).json({ error: "Review not found" });
     }
     const [rows] = await pool.query(
-      `SELECT r.*, u.name AS userName, u.email AS userEmail, p.name AS productName
+      `SELECT r.*, u.name AS userName, u.email AS userEmail, p.name AS productName, p.slug AS productSlug
          FROM reviews r
          LEFT JOIN \`user\` u ON u.id = r.userId
          LEFT JOIN products p ON p._id = r.productId
@@ -1411,6 +1465,15 @@ app.patch("/products/:id", verifyToken, requireAdmin, async (req, res) => {
       if (SKIP_FIELDS.includes(key)) continue;
       if (!EXTRA_WRITABLE_COLUMNS.has(key)) continue;
       updateDoc[key] = value;
+    }
+
+    // URLs are name-based, so a rename re-derives the slug (keeping -2, -3
+    // suffixes when another product already owns the name).
+    if ("name" in updateDoc) {
+      updateDoc.slug = await uniqueProductSlug(updateDoc.name, {
+        excludeId: productId,
+        fallbackId: productId,
+      });
     }
 
     for (const field of POLICY_FIELDS) {

@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS `jwks` (
 
 CREATE TABLE IF NOT EXISTS `products` (
   `_id` char(24) NOT NULL,
+  `slug` varchar(255) NOT NULL,
   `name` varchar(255) NOT NULL DEFAULT '',
   `description` mediumtext,
   `price` decimal(12,2) NOT NULL DEFAULT 0,
@@ -110,6 +111,7 @@ CREATE TABLE IF NOT EXISTS `products` (
   `createdAt` datetime(3) NOT NULL,
   `updatedAt` datetime(3) NOT NULL,
   PRIMARY KEY (`_id`),
+  UNIQUE KEY `products_slug_unique` (`slug`),
   KEY `products_category_subcategory_idx` (`category`, `subcategory`),
   KEY `products_price_idx` (`price`),
   KEY `products_stock_idx` (`stock`)

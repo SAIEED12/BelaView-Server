@@ -13,7 +13,8 @@ products, categories and users are created through the app afterwards.
    If you imported an earlier version of `schema.sql` before the client moved to
    MySQL, also import `database/carts.sql` once to create the cart table.
    Existing databases also need `database/reviews.sql` once to enable product
-   ratings and reviews.
+   ratings and reviews, and `database/product-slugs.sql` once to add the
+   name-based product URLs (`/products/<slug>`).
 
 ## 1. Upload the app
 
