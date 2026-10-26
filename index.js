@@ -179,6 +179,12 @@ const findSubcategory = (doc, slug) => {
 const isDuplicateKeyError = (error) =>
   error?.code === "ER_DUP_ENTRY" || error?.code === 11000;
 
+// Lets the API deploy before database/reviews.sql has been imported without
+// taking the product pages down; ratings simply read as zero until then.
+const isMissingReviewsTable = (error) =>
+  error?.code === "ER_NO_SUCH_TABLE" &&
+  /reviews/i.test(String(error?.sqlMessage ?? error?.message ?? ""));
+
 // ------------------------------------------------------------
 // MongoDB compatibility helpers
 // ------------------------------------------------------------
@@ -282,6 +288,104 @@ const rowToCategory = (row) => ({
   createdAt: row.createdAt,
   updatedAt: row.updatedAt,
 });
+
+// ------------------------------------------------------------
+// Reviews / ratings
+// ------------------------------------------------------------
+
+const MAX_REVIEW_COMMENT = 2000;
+
+const rowToReview = (row) => ({
+  _id: row._id,
+  productId: row.productId,
+  rating: Number(row.rating ?? 0),
+  comment: row.comment ?? "",
+  userName: row.userName ?? "Customer",
+  hidden: row.hidden === true || Number(row.hidden) === 1,
+  createdAt: row.createdAt,
+  updatedAt: row.updatedAt,
+});
+
+// Admin tables also need the joined product name and reviewer email.
+const rowToAdminReview = (row) => ({
+  ...rowToReview(row),
+  productName: row.productName ?? "",
+  userEmail: row.userEmail ?? "",
+});
+
+const roundRating = (value) => Math.round(Number(value ?? 0) * 100) / 100;
+
+const emptyRatingBreakdown = () => ({ 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 });
+
+// Public aggregate used by the product page and the review list.
+const getProductRatingSummary = async (productId) => {
+  try {
+    const [[stats]] = await pool.query(
+      `SELECT COUNT(*) AS total, AVG(rating) AS average
+         FROM reviews WHERE productId = ? AND hidden = 0`,
+      [productId],
+    );
+    const [breakdownRows] = await pool.query(
+      `SELECT rating, COUNT(*) AS count
+         FROM reviews WHERE productId = ? AND hidden = 0
+        GROUP BY rating`,
+      [productId],
+    );
+    const breakdown = emptyRatingBreakdown();
+    for (const row of breakdownRows) {
+      const rating = Number(row.rating);
+      if (rating >= 1 && rating <= 5) breakdown[rating] = Number(row.count ?? 0);
+    }
+    return {
+      average: roundRating(stats?.average),
+      total: Number(stats?.total ?? 0),
+      breakdown,
+    };
+  } catch (error) {
+    if (!isMissingReviewsTable(error)) throw error;
+    return { average: 0, total: 0, breakdown: emptyRatingBreakdown() };
+  }
+};
+
+// Attaches ratingAvg / ratingCount to a product list in one grouped query.
+const attachProductRatings = async (products) => {
+  if (!Array.isArray(products) || products.length === 0) return [];
+  const ids = products.map((product) => product._id);
+  try {
+    const placeholders = ids.map(() => "?").join(", ");
+    const [rows] = await pool.query(
+      `SELECT productId, COUNT(*) AS ratingCount, AVG(rating) AS ratingAvg
+         FROM reviews
+        WHERE hidden = 0 AND productId IN (${placeholders})
+        GROUP BY productId`,
+      ids,
+    );
+    const byProduct = new Map(
+      rows.map((row) => [
+        row.productId,
+        {
+          ratingAvg: roundRating(row.ratingAvg),
+          ratingCount: Number(row.ratingCount ?? 0),
+        },
+      ]),
+    );
+    return products.map((product) => {
+      const summary = byProduct.get(product._id);
+      return {
+        ...product,
+        ratingAvg: summary?.ratingAvg ?? 0,
+        ratingCount: summary?.ratingCount ?? 0,
+      };
+    });
+  } catch (error) {
+    if (!isMissingReviewsTable(error)) throw error;
+    return products.map((product) => ({
+      ...product,
+      ratingAvg: 0,
+      ratingCount: 0,
+    }));
+  }
+};
 
 const withTransaction = async (work) => {
   const conn = await pool.getConnection();
@@ -804,7 +908,7 @@ app.get("/products", async (req, res) => {
         `SELECT * FROM products ${query.sql} ORDER BY ${sortSql}`,
         query.params,
       );
-      return res.status(200).json(rows.map(rowToProduct));
+      return res.status(200).json(await attachProductRatings(rows.map(rowToProduct)));
     }
     let page = Number.parseInt(Array.isArray(req.query.page) ? req.query.page[0] : req.query.page, 10);
     let limit = Number.parseInt(Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit, 10);
@@ -885,7 +989,7 @@ app.get("/products", async (req, res) => {
       }))
       .sort((a, b) => b.count - a.count);
     return res.status(200).json({
-      products: rows.map(rowToProduct),
+      products: await attachProductRatings(rows.map(rowToProduct)),
       total,
       page,
       limit,
@@ -917,10 +1021,310 @@ app.get("/products/:id", async (req, res) => {
     if (!rows[0]) {
       return res.status(404).json({ error: "Product not found" });
     }
-    res.status(200).json(rowToProduct(rows[0]));
+    const product = rowToProduct(rows[0]);
+    const summary = await getProductRatingSummary(normalizeHexId(id));
+    res.status(200).json({
+      ...product,
+      ratingAvg: summary.average,
+      ratingCount: summary.total,
+    });
   } catch (error) {
     console.error("Error fetching product:", error);
     res.status(500).json({ error: "Failed to fetch product" });
+  }
+});
+
+// ------------------------------------------------------------
+// Product reviews
+// Any signed-in customer can rate a product. One review per
+// (userId, productId); submitting again updates that review.
+// ------------------------------------------------------------
+
+// Public: review list + aggregate for a product page.
+app.get("/products/:id/reviews", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isHexId(id)) {
+      return res.status(400).json({ error: "Invalid product id" });
+    }
+    const productId = normalizeHexId(id);
+    const [productRows] = await pool.query(
+      "SELECT `_id` FROM products WHERE `_id` = ? LIMIT 1",
+      [productId],
+    );
+    if (!productRows[0]) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+
+    let page = Number.parseInt(Array.isArray(req.query.page) ? req.query.page[0] : req.query.page, 10);
+    let limit = Number.parseInt(Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit, 10);
+    if (!Number.isInteger(page) || page < 1) page = 1;
+    if (!Number.isInteger(limit) || limit < 1) limit = 10;
+    limit = Math.min(limit, 50);
+
+    const [[countRow]] = await pool.query(
+      "SELECT COUNT(*) AS total FROM reviews WHERE productId = ? AND hidden = 0",
+      [productId],
+    );
+    const total = Number(countRow?.total ?? 0);
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+    if (page > totalPages) page = totalPages;
+
+    const [rows] = await pool.query(
+      `SELECT r.*, u.name AS userName
+         FROM reviews r
+         LEFT JOIN \`user\` u ON u.id = r.userId
+        WHERE r.productId = ? AND r.hidden = 0
+        ORDER BY r.createdAt DESC, r._id DESC
+        LIMIT ? OFFSET ?`,
+      [productId, limit, (page - 1) * limit],
+    );
+
+    const summary = await getProductRatingSummary(productId);
+    return res.status(200).json({
+      productId,
+      ...summary,
+      page,
+      limit,
+      totalPages,
+      reviews: rows.map(rowToReview),
+    });
+  } catch (error) {
+    if (isMissingReviewsTable(error)) {
+      return res.status(200).json({
+        productId: "",
+        average: 0,
+        total: 0,
+        breakdown: emptyRatingBreakdown(),
+        page: 1,
+        limit: 10,
+        totalPages: 1,
+        reviews: [],
+      });
+    }
+    console.error("Error fetching product reviews:", error);
+    res.status(500).json({ error: "Failed to fetch reviews" });
+  }
+});
+
+// Signed-in: the caller's own review for a product (null when none yet).
+app.get("/reviews/mine", verifyToken, async (req, res) => {
+  try {
+    const productId = normalizeHexId(req.query.productId);
+    if (!isHexId(productId)) {
+      return res.status(400).json({ error: "Invalid product id" });
+    }
+    const [rows] = await pool.query(
+      `SELECT r.*, u.name AS userName
+         FROM reviews r
+         LEFT JOIN \`user\` u ON u.id = r.userId
+        WHERE r.productId = ? AND r.userId = ?
+        LIMIT 1`,
+      [productId, req.user.userId],
+    );
+    return res.status(200).json({ review: rows[0] ? rowToReview(rows[0]) : null });
+  } catch (error) {
+    console.error("Error fetching own review:", error);
+    res.status(500).json({ error: "Failed to fetch review" });
+  }
+});
+
+// Signed-in: create or update the caller's review for a product.
+app.post("/reviews", verifyToken, async (req, res) => {
+  try {
+    const body = req.body;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return res.status(400).json({ error: "review body must be an object" });
+    }
+
+    const productId = normalizeHexId(body.productId);
+    if (!isHexId(productId)) {
+      return res.status(400).json({ error: "Invalid product id" });
+    }
+
+    const rating = Number(body.rating);
+    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+      return res.status(400).json({ error: "rating must be an integer between 1 and 5" });
+    }
+
+    if (body.comment !== undefined && body.comment !== null && typeof body.comment !== "string") {
+      return res.status(400).json({ error: "comment must be a string" });
+    }
+    const comment = typeof body.comment === "string" ? body.comment.trim() : "";
+    if (comment.length > MAX_REVIEW_COMMENT) {
+      return res.status(400).json({
+        error: `comment must be at most ${MAX_REVIEW_COMMENT} characters`,
+      });
+    }
+
+    const [productRows] = await pool.query(
+      "SELECT `_id` FROM products WHERE `_id` = ? LIMIT 1",
+      [productId],
+    );
+    if (!productRows[0]) {
+      return res.status(404).json({ error: "Product not found" });
+    }
+
+    const now = new Date();
+    await pool.query(
+      `INSERT INTO reviews (_id, productId, userId, rating, comment, hidden, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         rating = VALUES(rating),
+         comment = VALUES(comment),
+         updatedAt = VALUES(updatedAt)`,
+      [newId(), productId, req.user.userId, rating, comment || null, now, now],
+    );
+
+    const [rows] = await pool.query(
+      `SELECT r.*, u.name AS userName
+         FROM reviews r
+         LEFT JOIN \`user\` u ON u.id = r.userId
+        WHERE r.productId = ? AND r.userId = ?
+        LIMIT 1`,
+      [productId, req.user.userId],
+    );
+    const summary = await getProductRatingSummary(productId);
+
+    return res.status(200).json({
+      review: rowToReview(rows[0]),
+      summary,
+    });
+  } catch (error) {
+    console.error("Error saving review:", error);
+    if (isMissingReviewsTable(error)) {
+      return res.status(503).json({
+        error: "Reviews are not available yet. Please try again later.",
+      });
+    }
+    res.status(500).json({ error: "Failed to save review" });
+  }
+});
+
+// Admin: paginated moderation list (includes hidden reviews).
+app.get("/admin/reviews", verifyToken, requireAdmin, async (req, res) => {
+  try {
+    let page = Number.parseInt(Array.isArray(req.query.page) ? req.query.page[0] : req.query.page, 10);
+    let limit = Number.parseInt(Array.isArray(req.query.limit) ? req.query.limit[0] : req.query.limit, 10);
+    if (!Number.isInteger(page) || page < 1) page = 1;
+    if (!Number.isInteger(limit) || limit < 1) limit = 20;
+    limit = Math.min(limit, 100);
+
+    const rawFilter = Array.isArray(req.query.filter) ? req.query.filter[0] : req.query.filter;
+    const filter = typeof rawFilter === "string" ? rawFilter.trim().toLowerCase() : "all";
+    const rawQ = Array.isArray(req.query.q) ? req.query.q[0] : req.query.q;
+    const q = typeof rawQ === "string" ? rawQ.trim() : "";
+
+    const clauses = [];
+    if (filter === "visible") clauses.push({ sql: "r.hidden = 0", params: [] });
+    if (filter === "hidden") clauses.push({ sql: "r.hidden = 1", params: [] });
+    if (q) {
+      const like = `%${escapeLike(q)}%`;
+      clauses.push({
+        sql: `(r.comment LIKE ? ESCAPE '\\\\' OR u.name LIKE ? ESCAPE '\\\\' OR u.email LIKE ? ESCAPE '\\\\' OR p.name LIKE ? ESCAPE '\\\\')`,
+        params: [like, like, like, like],
+      });
+    }
+    const where = buildWhere(clauses);
+
+    const [[countRow]] = await pool.query(
+      `SELECT COUNT(*) AS total
+         FROM reviews r
+         LEFT JOIN \`user\` u ON u.id = r.userId
+         LEFT JOIN products p ON p._id = r.productId
+         ${where.sql}`,
+      where.params,
+    );
+    const total = Number(countRow?.total ?? 0);
+    const totalPages = Math.max(1, Math.ceil(total / limit));
+    if (page > totalPages) page = totalPages;
+
+    const [rows] = await pool.query(
+      `SELECT r.*, u.name AS userName, u.email AS userEmail, p.name AS productName
+         FROM reviews r
+         LEFT JOIN \`user\` u ON u.id = r.userId
+         LEFT JOIN products p ON p._id = r.productId
+         ${where.sql}
+        ORDER BY r.createdAt DESC, r._id DESC
+        LIMIT ? OFFSET ?`,
+      [...where.params, limit, (page - 1) * limit],
+    );
+
+    const [[hiddenRow]] = await pool.query(
+      "SELECT COUNT(*) AS hiddenCount FROM reviews WHERE hidden = 1",
+    );
+
+    return res.status(200).json({
+      reviews: rows.map(rowToAdminReview),
+      total,
+      hiddenCount: Number(hiddenRow?.hiddenCount ?? 0),
+      page,
+      limit,
+      totalPages,
+    });
+  } catch (error) {
+    console.error("Error fetching admin reviews:", error);
+    res.status(500).json({ error: "Failed to fetch reviews" });
+  }
+});
+
+// Admin: show/hide a review without deleting it.
+app.patch("/admin/reviews/:id", verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isHexId(id)) {
+      return res.status(400).json({ error: "Invalid review id" });
+    }
+    if (!req.body || typeof req.body.hidden !== "boolean") {
+      return res.status(400).json({ error: "hidden must be a boolean" });
+    }
+    const reviewId = normalizeHexId(id);
+    const [result] = await pool.query(
+      "UPDATE reviews SET hidden = ?, updatedAt = ? WHERE _id = ?",
+      [req.body.hidden ? 1 : 0, new Date(), reviewId],
+    );
+    if (Number(result.affectedRows ?? 0) === 0) {
+      return res.status(404).json({ error: "Review not found" });
+    }
+    const [rows] = await pool.query(
+      `SELECT r.*, u.name AS userName, u.email AS userEmail, p.name AS productName
+         FROM reviews r
+         LEFT JOIN \`user\` u ON u.id = r.userId
+         LEFT JOIN products p ON p._id = r.productId
+        WHERE r._id = ? LIMIT 1`,
+      [reviewId],
+    );
+    return res.status(200).json(rowToAdminReview(rows[0]));
+  } catch (error) {
+    console.error("Error updating review:", error);
+    res.status(500).json({ error: "Failed to update review" });
+  }
+});
+
+// Admin: permanently delete a review.
+app.delete("/admin/reviews/:id", verifyToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isHexId(id)) {
+      return res.status(400).json({ error: "Invalid review id" });
+    }
+    const reviewId = normalizeHexId(id);
+    const [rows] = await pool.query(
+      "SELECT productId FROM reviews WHERE _id = ? LIMIT 1",
+      [reviewId],
+    );
+    if (!rows[0]) {
+      return res.status(404).json({ error: "Review not found" });
+    }
+    await pool.query("DELETE FROM reviews WHERE _id = ?", [reviewId]);
+    return res.status(200).json({
+      success: true,
+      deletedId: reviewId,
+      productId: rows[0].productId,
+    });
+  } catch (error) {
+    console.error("Error deleting review:", error);
+    res.status(500).json({ error: "Failed to delete review" });
   }
 });
 
